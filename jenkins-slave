@@ -1,5 +1,6 @@
                                                  在K8S里面部署jenkins-slave
 准备：
+
 1.	系统全部使用的阿里云的centos7.6
     配置：用的磁盘40G，4C8G
 
