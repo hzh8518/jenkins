@@ -1,0 +1,133 @@
+k8s cicd项目
+1.jenkins主要用到的插件
+  Extended Choice Parameter
+  Config File Provider
+  Git Parameter
+
+2.然后需要几个凭据
+  docker_registry_auth（访问docker的仓库需要一个凭据）
+  git_auth （访问git服务器需要一个凭据,使用的秘钥）
+  k8s_auth  （Config File Provider插件生成的凭据，复制了k8s的config文件，没这个文件kubeatl无法访问集群）
+  withCredentials （这个不算一个完整的凭据，就是对已经生成的docker_registry_auth秘钥，做了一个用户名和密码的隐藏）
+
+3.持续集成一个springcloud的项目
+#!/usr/bin/env groovy
+// 公共
+def registry = "registry-vpc.cn-hangzhou.aliyuncs.com"
+// 项目
+def project = "goldplusgold"
+// def app_name = "demo"
+// def image_name=${registry}/${project}/k8s:\${service_name}_${BUILD_NUMBER}
+// def image_name = "${registry}/${project}/k8s:${service_name}_{BUILD_NUMBER}"
+def git_address = "172.16.6.86:/usr/local/src/jenkins"
+// 认证
+def secret_name = "registry-pull-secret"
+def docker_registry_auth = "1beb95b8-faa9-40e9-95df-5ac03d9a423a"
+def git_auth = "8eb30d90-1392-4edd-abe4-7f8b7838ef68"
+def k8s_auth = "2a80f35e-3b67-439a-85b0-b82bec48b3b5"
+
+pipeline {
+  agent {
+    kubernetes {
+      label "jenkins-slave"
+      yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+  name: jenkins-slave
+  namespace: ms
+spec:
+  containers:
+  - name: jnlp
+    image: registry-vpc.cn-hangzhou.aliyuncs.com/goldplusgold/k8s:jenkins_slave_v1
+    imagePullPolicy: Always
+    privileged: true
+    volumeMounts:
+      - name: docker-sock
+        mountPath: /var/run/docker.sock
+      - name: m2
+        mountPath: /root/.m2
+
+  volumes:
+    - name: docker-sock
+      hostPath:
+        path: /var/run/docker.sock
+    - name: m2
+      hostPath:
+        path: /tmp/m2
+
+    """
+   }
+  }
+parameters {
+   gitParameter branch: '', branchFilter: '.*', defaultValue: 'master', description: '请选择你要发布的分支', name: 'Branch', quickFilterEnabled: false, selectedValue: 'NONE', sortMode: 'NONE', tagFilter: '*', type: 'PT_BRANCH_TAG'
+   extendedChoice defaultValue: '', description: '选择发布的微服务', multiSelectDelimiter: ',' , name: 'Service', type: 'PT_CHECKBOX', value: 'gateway-service:9999,portal-service:8080,product-service:8010,order-service:8020,stock-service:8030'
+}
+  stages {
+    stage('拉取代码') {
+      steps{
+        checkout([$class: 'GitSCM', 
+        branches: [[name: "${Branch}"]], 
+        doGenerateSubmoduleConfiguratsons: false, 
+        extensions: [], submoduleCfg: [], 
+        userRemoteConfigs: [[credentialsId: "${git_auth}", 
+        url: "${git_address}"]]])
+    }
+    }
+    stage('代码编译'){
+       steps {
+          sh """ mvn clean package -Dmaven.test.skip=true
+          docker ps -a
+          """
+        }  
+    }
+    stage('构建镜像'){
+       steps {
+        withCredentials([usernamePassword(credentialsId: "${docker_registry_auth}", passwordVariable: 'password', usernameVariable: 'username')]) {
+        sh """
+         docker login --username="${username}"   --password="${password}" "${registry}"
+         for service in \$(echo "${Service}" | sed 's/,/ /g' ); do
+             service_name=\${service%:*}
+             image_name="${registry}"/"${project}"/k8s:\${service_name}_"${BUILD_NUMBER}"_`git rev-parse --short HEAD`
+             cd \${service_name}
+             if ls | grep biz &>/dev/null; then
+                cd \${service_name}-biz
+             fi
+             docker build  -t \${image_name} .
+             docker push \${image_name}
+             echo "${WORKSPACE}"
+             cd "${WORKSPACE}"
+         done
+         
+         """
+
+       }
+      } 
+    }
+    stage('deyloy'){
+       steps{
+         configFileProvider([configFile(fileId: "${k8s_auth}", 
+         targetLocation: "admin.kubeconfig")]){ 
+         sh """ 
+            for service in \$(echo "${Service}" | sed 's/,/ /g' ); do
+                service_name=\${service%:*}
+                sp_name=\${service%-*}
+                image_name="${registry}"/"${project}"/k8s:\${service_name}_"${BUILD_NUMBER}"_`git rev-parse --short HEAD`
+                sed -i -r "s#(image: )(.*)#image: \${image_name}#g" "${WORKSPACE}"/k8s/\${sp_name}.yaml
+                cat "${WORKSPACE}"/k8s/\${sp_name}.yaml
+                kubectl apply -f  "${WORKSPACE}"/k8s/\${sp_name}.yaml  --kubeconfig admin.kubeconfig  --record
+            done    
+            """
+         }
+        }  
+      }
+   }
+}
+
+#注意 我这个格式 真的是一个标点都不能动,很多次莫名其妙的错误，配置出来的,git rev-parse --short HEAD这是能取到commit的前几个id
+小节：出错了很多地方，而且是第一天OK第二天莫名其妙的错误 太伤心了，列举一下出错的地方
+1. 各种符号台容易出错了，少一个标点，有时候没任何出错提示,完全靠自己（尤其是那些pipeline需要包裹所有内容的  两个大括号，）
+2. 我的jenkins-slave镜像第一天还OK的，第二天莫名其妙的 docker不能找到 我已经挂载好了,还是不行 没办法,只能重新部署dockefile，把docker拷贝到镜像
+3. 我所有的什么密码 id都改成了变量，有的时候用变量真的不行•改来改去又好了  我很无语
+4. 根据自己的错误慢看研究失误把•••可能再一次部署还会出现意想不到的问题，多搞几套脚本，我这次是声明式的pipeline脚本 ，下次研究下node脚本式的pipleline部署方法
+   脚本式的上面也有方法，但是for循环微服务的 好像没有，下次弄一下
