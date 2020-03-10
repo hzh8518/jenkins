@@ -1,0 +1,436 @@
+                                                 在K8S里面部署jenkins-slave
+准备：
+1.	系统全部使用的阿里云的centos7.6
+    配置：用的磁盘40G，4C8G
+
+2.	部署git
+    1）yum  install   git  -y  #安装git客户端
+    2）git --bare init           #初始化git服务端
+    3）服务器免秘钥设置     #免秘钥，为了直接ssh的 方式拉取git服务器端的代码
+    4）git clone 172.16.6.86:/usr/local/src/git/app.git #在客户端服务器ssh方式拉取服务器项目
+
+3.	部署镜像仓库（我直接使用的阿里的镜像仓库，如果没部署用下面的办法部署一个自己的harbar镜像仓库）
+    1）下载离线安装包 https://github.com/goharbor/harbor/releases 
+    2）解压并配置访问地址 # tar zxvf harbor-offline-installer-v1.6.1.tgz 
+       # cd harbor # vi harbor.cfg hostname = 10.206.240.188
+         harbor_admin_password = 123456 
+    3）准备配置 # ./prepare 
+    4）导入镜像并启动 # ./install.sh 
+    5）查看容器状态 # docker-compose ps
+
+
+4.	kubernetes中部署jenkins
+    jenkins官方网站
+    https://jenkins.io/zh/
+
+    我们部署K8S肯定需要使用docker来部署jenkins，下面是docker部署jenkins地址
+    https://hub.docker.com/r/jenkins/jenkins
+    可以看到官方的两个镜像
+       • To use the latest LTS: docker pull jenkins/jenkins:lts 
+       •	To use the latest weekly: docker pull jenkins/jenkins
+
+
+部署
+jenkins关于kubernetes的插件
+参考文档：https://github.com/jenkinsci/kubernetes-plugin/tree/fc40c869edfd9e3904a9a56b0f80c5a25e988fa1/src/main/kubernetes
+ 
+1.	Jenkins在Kubernetes中动态创建代理
+插件介绍：https://github.com/jenkinsci/kubernetes-plugin
+Jenkins需要有状态的方法去部署他，需要有持久化存储，我们之前测试过了NFS，现在我们需要测试阿里云的NAS来作为持久化
+
+
+#部署NFS的持久化存储
+来到nfs服务器部署nfs服务
+1）yum  install nfs-utils  -y
+这个包所有的k8s集群的服务器都需要，一般都是node节点
+
+2）#然后我们需要暴露一个目录 让K8S服务器去挂载
+vim /etc/exports
+/ifs/kubernetes *(rw,sync,no_root_squash)
+mkdir /ifs/kubernetes –p
+启动服务
+systemctl restart nfs
+
+3)检测nfs的客户端能否挂载
+showmount -e 172.16.6.86
+显示如下证明能挂载
+Export list for 172.16.6.86:
+/ifs/kubernetes *
+#找台nfs的客户端机器 测试下 尝试挂载下 服务端这个nfs
+mount -t nfs 172.16.6.86:/ifs/kubernetes   /mnt/
+创建个文件测试下
+cd  /mnt
+echo 123.txt  > 123.txt
+然后去nfs服务端查看下是否有123.txt这个文件，如果有证明ok
+测试ok之后取消挂载umount -lf  /mnt
+
+阿里云nas持久化文档地址
+4）k8s部署jenkins
+https://help.aliyun.com/document_detail/130727.html?spm=a2c4g.11186623.6.720.37673910zPIIUU
+我们已经购买了阿里云的nas，这是nas的文档
+
+1）我们现在动态使用nas••直接部署一个storageclass
+StorageClass的yaml文件主要写对你的nas地址•官方文档都教了你怎么部署的
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: alicloud-nas
+mountOptions:
+- nolock,tcp,noresvport
+- vers=3
+parameters:
+  server: " 00d78d2a-spz7.cn-hangzhou.extreme.nas.aliyuncs.com:/share /"
+  driver: flexvolume
+provisioner: alicloud/nas
+reclaimPolicy: Delete
+
+
+2）我们部署的地址是参考官方的  部署jenkins的两个资源文件•
+https://github.com/jenkinsci/kubernetes-plugin/tree/master/src/main/kubernetes
+ 
+两个yml部署文件
+1）vi jenkins.yml
+# jenkins
+---
+apiVersion: apps/v1beta1
+kind: StatefulSet
+metadata:
+  name: jenkins
+  labels:
+    name: jenkins
+spec:
+  serviceName: jenkins
+  replicas: 1
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    spec:
+      terminationGracePeriodSeconds: 10
+      serviceAccountName: jenkins
+      containers:
+        - name: jenkins
+          image: jenkins/jenkins:lts-alpine
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+            - containerPort: 50000
+          resources:
+            limits:
+              cpu: 1
+              memory: 1Gi
+            requests:
+              cpu: 0.5
+              memory: 500Mi
+          env:
+            - name: LIMITS_MEMORY
+              valueFrom:
+                resourceFieldRef:
+                  resource: limits.memory
+                  divisor: 1Mi
+            - name: JAVA_OPTS
+             value: -Xmx500m -XshowSettings:vm -Dhudson.slaves.NodeProvisioner.initialDelay=0 -Dhudson.slaves.NodeProvisioner.MARGIN=50 -Dhudson.slaves.NodeProvisioner.MARGIN0=0.85  -Duser.timezone=Asia/Shanghai
+          volumeMounts:
+            - name: jenkins-home
+              mountPath: /var/jenkins_home
+          livenessProbe:
+            httpGet:
+              path: /login
+              port: 8080
+            initialDelaySeconds: 60
+            timeoutSeconds: 5
+            failureThreshold: 12 # ~2 minutes
+          readinessProbe:
+            httpGet:
+              path: /login
+              port: 8080
+            initialDelaySeconds: 60
+            timeoutSeconds: 5
+            failureThreshold: 12 # ~2 minutes
+      securityContext:
+        fsGroup: 1000
+  volumeClaimTemplates:
+  - metadata:
+      name: jenkins-home
+      # annotations:
+      #   volume.beta.kubernetes.io/storage-class: anything
+    spec:
+      storageClassName: alicloud-nas     #我这里是自动申请阿里云的nas资源 我购买了nas••如果你的是nfs•就需要nfs的方式部署
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 1Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jenkins
+spec:
+  # type: LoadBalancer
+  selector:
+    name: jenkins
+  # ensure the client ip is propagated to avoid the invalid crumb issue when using LoadBalancer (k8s >=1.7)
+  #externalTrafficPolicy: Local
+  ports:
+    -
+      name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+    -
+      name: agent
+      port: 50000
+      protocol: TCP
+
+---
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: jenkins
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    kubernetes.io/tls-acme: "true"
+    # "413 Request Entity Too Large" uploading plugins, increase client_max_body_size
+    nginx.ingress.kubernetes.io/proxy-body-size: 50m
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+    # For nginx-ingress controller < 0.9.0.beta-18
+    ingress.kubernetes.io/ssl-redirect: "true"
+    # "413 Request Entity Too Large" uploading plugins, increase client_max_body_size
+    ingress.kubernetes.io/proxy-body-size: 50m
+    ingress.kubernetes.io/proxy-request-buffering: "off"
+spec:
+  rules:
+  - http:
+      paths:
+      - path: /
+        backend:
+          serviceName: jenkins
+          servicePort: 80
+    host: jenkins.example.com
+  tls:
+  - hosts:
+    - jenkins.example.com
+    secretName: tls-jenkins
+#注释：jenkins.yml主要是三段 statefulset，service和ingress  storageclass  上面jenkins的JAVA_OPTS命令加一个时区 重要 -Duser.timezone=Asia/Shanghai  
+jenkins.example.com还一个访问的域名，我自己测试 直接解析到hosts和一个node去绑定，这个域名还有tls证书，需要自己创建一个证书，端口是8080个50000（50000端口master-slave会用到）都要放行，jenkins镜像使用的是jenkins/jenkins:lts-alpine。Jenkins的数据/var/jenkins_home需要保存的，jenkins是通过pvc来持久化的，我们部署jenkins之前需要先部署nfs的pvc绑定  我测试过了用阿里云的NAS自动申请资源 也是OK的
+
+三个文件部署nfs的绑定
+1）cat class.yaml 
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: managed-nfs-storage
+provisioner: fuseim.pri/ifs 
+# or choose another name, must match deployment's env PROVISIONER_NAME'
+parameters:
+  archiveOnDelete: "true"
+#storage class文件是为了动态创建pv的 ，class的名称很重要，
+K8s在挂载pod的时候可以根据这个class名字在pvc模板 上指定需要绑定的pv。还有provisioner: fuseim.pri/ifs 这个值，等下第二个文件deploymeng.yml需要被引用
+文件二nfs作为存储部署做成pvc，还需要有在k8s的nfs的客户端
+  vim  deployment.yaml 
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nfs-client-provisioner
+---
+kind: Deployment
+apiVersion: extensions/v1beta1
+metadata:
+  name: nfs-client-provisioner
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: nfs-client-provisioner
+    spec:
+      serviceAccountName: nfs-client-provisioner
+      containers:
+        - name: nfs-client-provisioner
+          image: lizhenliang/nfs-client-provisioner:latest
+          volumeMounts:
+            - name: nfs-client-root
+              mountPath: /persistentvolumes
+          env:
+            - name: PROVISIONER_NAME
+              value: fuseim.pri/ifs
+            - name: NFS_SERVER
+              value: 172.16.6.86
+            - name: NFS_PATH
+              value: /ifs/kubernetes
+      volumes:
+        - name: nfs-client-root
+          nfs:
+            server: 172.16.6.86
+            path: /ifs/kubernetes
+#注释：value: fuseim.pri/ifs这个变量名就是之前storage-class文件里面引用过来的，然后需要修改下你自己nfs的地址
+
+#文件三 部署nfspvc绑定
+more rbac.yaml 
+kind: ServiceAccount
+apiVersion: v1
+metadata:
+  name: nfs-client-provisioner
+---
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: nfs-client-provisioner-runner
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "update", "patch"]
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: run-nfs-client-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: nfs-client-provisioner
+    namespace: default
+roleRef:
+  kind: ClusterRole
+  name: nfs-client-provisioner-runner
+  apiGroup: rbac.authorization.k8s.io
+---
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: leader-locking-nfs-client-provisioner
+rules:
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: leader-locking-nfs-client-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: nfs-client-provisioner
+    # replace with namespace where provisioner is deployed
+    namespace: default
+roleRef:
+  kind: Role
+  name: leader-locking-nfs-client-provisioner
+  apiGroup: rbac.authorization.k8s.io
+#这个也是官方提供 不需要修改，
+这三个文件 就修改了一下nfs的地址••还有lizhenliang/nfs-client-provisioner:latest这个镜像，其他都固定的
+
+#创建这几个nfs文件
+class.yaml  deployment.yaml  rbac.yaml
+kubectl create  -f .
+#已经查看得到这个client了
+ 
+#我这边第二次部署使用了NAS部署   如果是NAS申请服务器的pv和pvc的 话就不需要看 这个nfs的部署了
+
+2）k8s部署jenkins文件 之二 
+vim  service-account.yml 
+# In GKE need to get RBAC permissions first with
+# kubectl create clusterrolebinding cluster-admin-binding --clusterrole=cluster-admin [--user=<user-name>|--group=<group-name>]
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jenkins
+
+---
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1beta1
+metadata:
+  name: jenkins
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["create","delete","get","list","patch","update","watch"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create","delete","get","list","patch","update","watch"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get","list","watch"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: RoleBinding
+metadata:
+  name: jenkins
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: jenkins
+subjects:
+- kind: ServiceAccount
+  name: jenkins
+
+#然后可以在K8S部署jenkins，基本上全部用的官方的配置
+Nfs的目录也设置的和官方的配置一样
+
+[root@k8s072451-3 live_jenkins]# ls
+jenkins.yml  service-account.yml
+[root@k8s072451-3 live_jenkins]# kubectl create -f .
+statefulset.apps/jenkins created
+service/jenkins created
+ingress.extensions/jenkins created
+serviceaccount/jenkins created
+role.rbac.authorization.k8s.io/jenkins created
+rolebinding.rbac.authorization.k8s.io/jenkins created
+#部署之后 如果pvc没绑定 jenkins起不来，需要删除pvc 重新绑定就ok了
+通过查看jenkins的日志能看到密码
+kubectl logs jenkins-0
+查看下pvc和pv  我这边之前部署了三个jenkins，就自动绑定了三个pvc，后来删除了两个jenkins 就部署了一个••
+ 
+#k8s部署jenkins是用的statefulset
+ 
+
+#部署的nfs客户端工具，其实只要一个，我这里部署了三个•，部署三个是有问题的 只要一个••••我这后来修改了，如果是nas就不要看了
+ 
+
+nas部署的截图
+ 
+ 
+#nas自动部署pvc和pv 太爽了•••只需要一个storageclass和一个jenkins.yml和sa认证 几下就部署好了
+
+5）配置和安装jenkins 和jenkins插件
+#进入到选择插件，我们就选几个插件来安装
+ 
+ 
+ 
+ 
+#我这边就安装了打钩的插件•••没打钩的 就算截图了 也没安装
+ 
+Jenkins的插件将来我们可以 用到什么安装什么••••••这里就算一个都不安装都OK的
+
+ 
+看不到的都设置的admin
+http://jenkins.gold-malls.com/
+ 
+#我这边插件什么都没选，我准备把之前jenkins的插件 直接放到nas里面去
+然后需要重新加载一下 稍微添加一个标签 然后直接apply  就能加载成功 我这边把插件放到 nas里面 就已经 OK了••••
+
+#jenkins安装插件默认是谷歌的地址 相当的慢•••怎么解决这个问题呢
+需要直接去到jenkins的配置文件 修改一个updates下面的文件
+vim default.json
+ 、
+主要修改两个地方  一个是 谷歌修改成百度   还一个是 下载的插件地址修改成清华源
+ 
+#这个下载jenkins的插件源我还没测试•••••但是之前确实是下载插件非常慢的••••  
+sed -i  's#http://updates.jenkins-ci.org/download#https://mirrors.tuna.tsinghua.edu.cn/jenkins#g' default.json
+sed -i  's#http://www.google.com#https://www.baidu.com#g' default.json
