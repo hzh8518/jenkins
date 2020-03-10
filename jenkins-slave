@@ -1,69 +1,5 @@
                                                  在K8S里面部署jenkins-slave
-准备：
 
-1.	系统全部使用的阿里云的centos7.6
-    配置：用的磁盘40G，4C8G
-
-2.	部署git
-    1）yum  install   git  -y  #安装git客户端
-    2）git --bare init           #初始化git服务端
-    3）服务器免秘钥设置     #免秘钥，为了直接ssh的 方式拉取git服务器端的代码
-    4）git clone 172.16.6.86:/usr/local/src/git/app.git #在客户端服务器ssh方式拉取服务器项目
-
-3.	部署镜像仓库（我直接使用的阿里的镜像仓库，如果没部署用下面的办法部署一个自己的harbar镜像仓库）
-    1）下载离线安装包 https://github.com/goharbor/harbor/releases 
-    2）解压并配置访问地址 # tar zxvf harbor-offline-installer-v1.6.1.tgz 
-       # cd harbor # vi harbor.cfg hostname = 10.206.240.188
-         harbor_admin_password = 123456 
-    3）准备配置 # ./prepare 
-    4）导入镜像并启动 # ./install.sh 
-    5）查看容器状态 # docker-compose ps
-
-
-4.	kubernetes中部署jenkins
-    jenkins官方网站
-    https://jenkins.io/zh/
-
-    我们部署K8S肯定需要使用docker来部署jenkins，下面是docker部署jenkins地址
-    https://hub.docker.com/r/jenkins/jenkins
-    可以看到官方的两个镜像
-       • To use the latest LTS: docker pull jenkins/jenkins:lts 
-       •	To use the latest weekly: docker pull jenkins/jenkins
-
-
-部署
-jenkins关于kubernetes的插件
-参考文档：https://github.com/jenkinsci/kubernetes-plugin/tree/fc40c869edfd9e3904a9a56b0f80c5a25e988fa1/src/main/kubernetes
- 
-1.	Jenkins在Kubernetes中动态创建代理
-插件介绍：https://github.com/jenkinsci/kubernetes-plugin
-Jenkins需要有状态的方法去部署他，需要有持久化存储，我们之前测试过了NFS，现在我们需要测试阿里云的NAS来作为持久化
-
-
-#部署NFS的持久化存储
-来到nfs服务器部署nfs服务
-1）yum  install nfs-utils  -y
-这个包所有的k8s集群的服务器都需要，一般都是node节点
-
-2）#然后我们需要暴露一个目录 让K8S服务器去挂载
-vim /etc/exports
-/ifs/kubernetes *(rw,sync,no_root_squash)
-mkdir /ifs/kubernetes –p
-启动服务
-systemctl restart nfs
-
-3)检测nfs的客户端能否挂载
-showmount -e 172.16.6.86
-显示如下证明能挂载
-Export list for 172.16.6.86:
-/ifs/kubernetes *
-#找台nfs的客户端机器 测试下 尝试挂载下 服务端这个nfs
-mount -t nfs 172.16.6.86:/ifs/kubernetes   /mnt/
-创建个文件测试下
-cd  /mnt
-echo 123.txt  > 123.txt
-然后去nfs服务端查看下是否有123.txt这个文件，如果有证明ok
-测试ok之后取消挂载umount -lf  /mnt
 
 阿里云nas持久化文档地址
 4）k8s部署jenkins
@@ -215,128 +151,6 @@ spec:
 #注释：jenkins.yml主要是三段 statefulset，service和ingress  storageclass  上面jenkins的JAVA_OPTS命令加一个时区 重要 -Duser.timezone=Asia/Shanghai  
 jenkins.example.com还一个访问的域名，我自己测试 直接解析到hosts和一个node去绑定，这个域名还有tls证书，需要自己创建一个证书，端口是8080个50000（50000端口master-slave会用到）都要放行，jenkins镜像使用的是jenkins/jenkins:lts-alpine。Jenkins的数据/var/jenkins_home需要保存的，jenkins是通过pvc来持久化的，我们部署jenkins之前需要先部署nfs的pvc绑定  我测试过了用阿里云的NAS自动申请资源 也是OK的
 
-三个文件部署nfs的绑定
-1）cat class.yaml 
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: managed-nfs-storage
-provisioner: fuseim.pri/ifs 
-# or choose another name, must match deployment's env PROVISIONER_NAME'
-parameters:
-  archiveOnDelete: "true"
-#storage class文件是为了动态创建pv的 ，class的名称很重要，
-K8s在挂载pod的时候可以根据这个class名字在pvc模板 上指定需要绑定的pv。还有provisioner: fuseim.pri/ifs 这个值，等下第二个文件deploymeng.yml需要被引用
-文件二nfs作为存储部署做成pvc，还需要有在k8s的nfs的客户端
-  vim  deployment.yaml 
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: nfs-client-provisioner
----
-kind: Deployment
-apiVersion: extensions/v1beta1
-metadata:
-  name: nfs-client-provisioner
-spec:
-  replicas: 1
-  strategy:
-    type: Recreate
-  template:
-    metadata:
-      labels:
-        app: nfs-client-provisioner
-    spec:
-      serviceAccountName: nfs-client-provisioner
-      containers:
-        - name: nfs-client-provisioner
-          image: lizhenliang/nfs-client-provisioner:latest
-          volumeMounts:
-            - name: nfs-client-root
-              mountPath: /persistentvolumes
-          env:
-            - name: PROVISIONER_NAME
-              value: fuseim.pri/ifs
-            - name: NFS_SERVER
-              value: 172.16.6.86
-            - name: NFS_PATH
-              value: /ifs/kubernetes
-      volumes:
-        - name: nfs-client-root
-          nfs:
-            server: 172.16.6.86
-            path: /ifs/kubernetes
-#注释：value: fuseim.pri/ifs这个变量名就是之前storage-class文件里面引用过来的，然后需要修改下你自己nfs的地址
-
-#文件三 部署nfspvc绑定
-more rbac.yaml 
-kind: ServiceAccount
-apiVersion: v1
-metadata:
-  name: nfs-client-provisioner
----
-kind: ClusterRole
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: nfs-client-provisioner-runner
-rules:
-  - apiGroups: [""]
-    resources: ["persistentvolumes"]
-    verbs: ["get", "list", "watch", "create", "delete"]
-  - apiGroups: [""]
-    resources: ["persistentvolumeclaims"]
-    verbs: ["get", "list", "watch", "update"]
-  - apiGroups: ["storage.k8s.io"]
-    resources: ["storageclasses"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: [""]
-    resources: ["events"]
-    verbs: ["create", "update", "patch"]
----
-kind: ClusterRoleBinding
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: run-nfs-client-provisioner
-subjects:
-  - kind: ServiceAccount
-    name: nfs-client-provisioner
-    namespace: default
-roleRef:
-  kind: ClusterRole
-  name: nfs-client-provisioner-runner
-  apiGroup: rbac.authorization.k8s.io
----
-kind: Role
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: leader-locking-nfs-client-provisioner
-rules:
-  - apiGroups: [""]
-    resources: ["endpoints"]
-    verbs: ["get", "list", "watch", "create", "update", "patch"]
----
-kind: RoleBinding
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: leader-locking-nfs-client-provisioner
-subjects:
-  - kind: ServiceAccount
-    name: nfs-client-provisioner
-    # replace with namespace where provisioner is deployed
-    namespace: default
-roleRef:
-  kind: Role
-  name: leader-locking-nfs-client-provisioner
-  apiGroup: rbac.authorization.k8s.io
-#这个也是官方提供 不需要修改，
-这三个文件 就修改了一下nfs的地址••还有lizhenliang/nfs-client-provisioner:latest这个镜像，其他都固定的
-
-#创建这几个nfs文件
-class.yaml  deployment.yaml  rbac.yaml
-kubectl create  -f .
-#已经查看得到这个client了
- 
-#我这边第二次部署使用了NAS部署   如果是NAS申请服务器的pv和pvc的 话就不需要看 这个nfs的部署了
 
 2）k8s部署jenkins文件 之二 
 vim  service-account.yml 
@@ -398,22 +212,11 @@ rolebinding.rbac.authorization.k8s.io/jenkins created
 kubectl logs jenkins-0
 查看下pvc和pv  我这边之前部署了三个jenkins，就自动绑定了三个pvc，后来删除了两个jenkins 就部署了一个••
  
-#k8s部署jenkins是用的statefulset
- 
-
-#部署的nfs客户端工具，其实只要一个，我这里部署了三个•，部署三个是有问题的 只要一个••••我这后来修改了，如果是nas就不要看了
- 
-
-nas部署的截图
- 
- 
-#nas自动部署pvc和pv 太爽了•••只需要一个storageclass和一个jenkins.yml和sa认证 几下就部署好了
+k8s部署jenkins是用的statefulset
+nas自动部署pvc和pv 太爽了•••只需要一个storageclass和一个jenkins.yml和sa认证 几下就部署好了
 
 5）配置和安装jenkins 和jenkins插件
 #进入到选择插件，我们就选几个插件来安装
- 
- 
- 
  
 #我这边就安装了打钩的插件•••没打钩的 就算截图了 也没安装
  
